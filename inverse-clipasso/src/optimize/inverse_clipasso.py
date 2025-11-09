@@ -10,9 +10,9 @@ from typing import Dict, Iterable
 
 import torch
 
-from inverse_clipasso.src.clip.clip_api import ClipModel
-from inverse_clipasso.src.render.diffvg_wrapper import render_svg
-from inverse_clipasso.src.optimize import losses
+from src.clip.clip_api import ClipModel
+from src.render.diffvg_wrapper import render_svg
+from src.optimize import losses
 
 
 @dataclass
