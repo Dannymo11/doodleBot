@@ -1,0 +1,106 @@
+{
+  "timestamp": "2025-11-11 02:57:24",
+  "config": {
+    "samples_per_class": 10,
+    "classes": [
+      "cat",
+      "car",
+      "apple",
+      "tree",
+      "house"
+    ],
+    "test_classes": [
+      "cat",
+      "car"
+    ],
+    "output_dir": "outputs",
+    "results_file": null
+  },
+  "tests": [
+    {
+      "test": "imports",
+      "status": "passed",
+      "errors": []
+    },
+    {
+      "test": "data_loading",
+      "status": "passed",
+      "errors": [],
+      "files_found": [
+        {
+          "class": "cat",
+          "samples": 123202
+        },
+        {
+          "class": "car",
+          "samples": 182764
+        }
+      ],
+      "files_missing": []
+    },
+    {
+      "test": "rendering",
+      "status": "passed",
+      "errors": []
+    },
+    {
+      "test": "clip_loading",
+      "status": "passed",
+      "errors": [],
+      "device": "mps",
+      "model_name": "ViT-B/32"
+    },
+    {
+      "test": "single_prediction",
+      "status": "passed",
+      "errors": [],
+      "true_label": "car",
+      "predicted_label": "car",
+      "correct": true,
+      "similarities": {
+        "cat": 0.25390625,
+        "car": 0.35595703125
+      }
+    },
+    {
+      "test": "batch_evaluation",
+      "status": "passed",
+      "errors": [],
+      "overall_accuracy": 1.0,
+      "per_class_accuracy": {
+        "cat": {
+          "accuracy": 1.0,
+          "correct": 10,
+          "total": 10
+        },
+        "car": {
+          "accuracy": 1.0,
+          "correct": 10,
+          "total": 10
+        }
+      },
+      "total_samples": 20,
+      "correct_samples": 20,
+      "runtime_seconds": 0.42799997329711914
+    },
+    {
+      "test": "prompt_comparison",
+      "status": "passed",
+      "errors": [],
+      "true_label": "cat",
+      "best_prompt": "sketch of a cat",
+      "prompt_scores": {
+        "cat": 0.29345703125,
+        "sketch of a cat": 0.3095703125,
+        "car": 0.2427978515625,
+        "sketch of a car": 0.2379150390625
+      }
+    }
+  ],
+  "summary": {
+    "total_tests": 7,
+    "passed": 7,
+    "failed": 0,
+    "partial": 0
+  }
+}

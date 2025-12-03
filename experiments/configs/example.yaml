@@ -1,0 +1,9 @@
+run_name: example-sketch
+label: "cat"
+steps: 500
+lr: 0.01
+canvas_size: 224
+loss_weights:
+  semantic: 1.0
+  stroke: 0.1
+  tv: 0.01

@@ -1,1 +1,0 @@
-"""Inverse CLIPasso source package."""

@@ -1,0 +1,13 @@
+torch
+torchvision
+numpy
+scipy
+matplotlib
+pandas
+scikit-image
+clip-anytorch
+svgwrite
+# diffvg
+hydra-core
+tqdm
+wandb
