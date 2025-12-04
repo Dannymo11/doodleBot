@@ -82,6 +82,35 @@ class ClipModel:
         emb = emb.float()
         return emb / emb.norm(dim=-1, keepdim=True)
 
+    def encode_text_multi(self, prompts: list[str]) -> torch.Tensor:
+        """
+        Encode multiple text prompts and average their embeddings.
+        
+        This gives a more robust target for optimization by averaging
+        different phrasings of the same concept. For example:
+        ["a cat", "a drawing of a cat", "a sketch of a cat"]
+        
+        Args:
+            prompts: List of text prompts to encode and average.
+        
+        Returns:
+            Averaged and normalized text embedding [1, D].
+        """
+        if not prompts:
+            raise ValueError("Must provide at least one prompt")
+        
+        # Encode all prompts at once for efficiency
+        tokens = clip.tokenize(prompts).to(self.device)
+        with torch.no_grad():
+            embeddings = self.model.encode_text(tokens)  # [N, D]
+        
+        # Average embeddings
+        embeddings = embeddings.float()
+        avg_emb = embeddings.mean(dim=0, keepdim=True)  # [1, D]
+        
+        # Normalize the averaged embedding
+        return avg_emb / avg_emb.norm(dim=-1, keepdim=True)
+
 def compute_similarity(image_embed: torch.Tensor, text_embed: torch.Tensor) -> torch.Tensor:
     """
     Cosine similarity helper.
