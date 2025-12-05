@@ -27,6 +27,7 @@ from src.inverse_clipasso.optimize.losses import (
     aggregate_losses,
     original_strokes_loss,
     exemplar_loss,
+    reference_image_loss,
 )
 
 
@@ -130,6 +131,38 @@ class OptimizationConfig:
     
     exemplar_mode: str = "mean"
     """How to aggregate exemplar similarities: 'mean', 'min', 'softmin'."""
+    
+    # Reference image guidance (use a perfect sketch as target)
+    use_reference_image: bool = False
+    """If True, guides optimization toward a reference image embedding."""
+    
+    reference_image_embedding: Optional[torch.Tensor] = None
+    """Pre-computed CLIP embedding of the reference image [1, D]."""
+    
+    reference_image_weight: float = 1.0
+    """Weight for reference image loss (how strongly to pull toward the reference)."""
+    
+    blend_text_and_reference: bool = False
+    """If True, blends text embedding with reference image embedding."""
+    
+    text_reference_blend: float = 0.5
+    """Blend ratio: 0.0 = pure text, 1.0 = pure reference image."""
+    
+    # Stroke addition during optimization
+    allow_stroke_addition: bool = False
+    """If True, allows adding new strokes during optimization."""
+    
+    stroke_add_interval: int = 200
+    """Add a new stroke every N steps (only if allow_stroke_addition is True)."""
+    
+    max_strokes: int = 20
+    """Maximum number of strokes to have (won't add beyond this)."""
+    
+    new_stroke_points: int = 4
+    """Number of control points for newly added strokes."""
+    
+    stroke_init_mode: str = "random"
+    """How to initialize new strokes: 'random', 'center', 'edge'."""
 
 
 @dataclass
@@ -272,6 +305,87 @@ class InverseClipassoOptimizer:
         else:
             return end_weight
     
+    def _create_new_stroke(
+        self,
+        existing_strokes: List[torch.Tensor],
+        canvas_size: int = 224,
+    ) -> torch.Tensor:
+        """
+        Create a new stroke to add to the sketch.
+        
+        Args:
+            existing_strokes: Current strokes (used to find empty areas).
+            canvas_size: Size of the canvas.
+        
+        Returns:
+            New stroke tensor with shape [num_points, 2].
+        """
+        num_points = self.config.new_stroke_points
+        mode = self.config.stroke_init_mode
+        padding = 20  # Keep strokes away from edges
+        
+        if mode == "random":
+            # Random position and shape
+            center_x = torch.rand(1).item() * (canvas_size - 2 * padding) + padding
+            center_y = torch.rand(1).item() * (canvas_size - 2 * padding) + padding
+            
+            # Create a small stroke around the center
+            angles = torch.linspace(0, 2 * 3.14159, num_points + 1)[:-1]
+            radius = 15 + torch.rand(1).item() * 20  # Random radius 15-35
+            
+            points = torch.zeros(num_points, 2)
+            for i, angle in enumerate(angles):
+                # Add some randomness to each point
+                r = radius * (0.8 + 0.4 * torch.rand(1).item())
+                points[i, 0] = center_x + r * torch.cos(angle)
+                points[i, 1] = center_y + r * torch.sin(angle)
+            
+        elif mode == "center":
+            # Start from center of canvas
+            center_x = canvas_size / 2
+            center_y = canvas_size / 2
+            
+            # Small stroke near center
+            points = torch.zeros(num_points, 2)
+            for i in range(num_points):
+                points[i, 0] = center_x + (i - num_points/2) * 10 + torch.rand(1).item() * 5
+                points[i, 1] = center_y + torch.rand(1).item() * 20 - 10
+            
+        elif mode == "edge":
+            # Start from a random edge
+            edge = torch.randint(0, 4, (1,)).item()  # 0=top, 1=right, 2=bottom, 3=left
+            
+            if edge == 0:  # Top
+                start_x = torch.rand(1).item() * canvas_size
+                start_y = padding
+            elif edge == 1:  # Right
+                start_x = canvas_size - padding
+                start_y = torch.rand(1).item() * canvas_size
+            elif edge == 2:  # Bottom
+                start_x = torch.rand(1).item() * canvas_size
+                start_y = canvas_size - padding
+            else:  # Left
+                start_x = padding
+                start_y = torch.rand(1).item() * canvas_size
+            
+            # Create stroke moving inward
+            points = torch.zeros(num_points, 2)
+            direction = torch.rand(2) - 0.5
+            direction = direction / direction.norm() * 15  # Normalize to length 15
+            
+            for i in range(num_points):
+                points[i, 0] = start_x + direction[0] * i
+                points[i, 1] = start_y + direction[1] * i
+        
+        else:
+            # Default to random
+            points = torch.rand(num_points, 2) * (canvas_size - 2 * padding) + padding
+        
+        # Ensure points are within bounds
+        points = points.clamp(padding, canvas_size - padding)
+        
+        return points.to(self.device).requires_grad_(True)
+    
     def _compute_losses(
         self, 
         strokes: List[torch.Tensor],
@@ -302,6 +416,13 @@ class InverseClipassoOptimizer:
                 img_embedding,
                 self.config.exemplar_embeddings.to(self.device),
                 mode=self.config.exemplar_mode,
+            ).mean()
+        
+        # Reference image loss (guide toward a perfect sketch)
+        if self.config.use_reference_image and self.config.reference_image_embedding is not None:
+            losses["reference"] = reference_image_loss(
+                img_embedding,
+                self.config.reference_image_embedding.to(self.device),
             ).mean()
         
         # Stroke regularization (smoothness + length)
@@ -357,12 +478,14 @@ class InverseClipassoOptimizer:
             "total": [],
             "semantic": [],
             "exemplar": [],  # For exemplar-guided refinement
+            "reference": [],  # For reference image guidance
             "stroke": [],
             "tv": [],
             "original": [],  # For refinement mode
             "original_weight": [],  # Track scheduled weight
             "similarity": [],
             "lr": [],
+            "num_strokes": [],  # Track stroke count over time
         }
         
         # Noise tracking
@@ -423,10 +546,29 @@ class InverseClipassoOptimizer:
                 for stroke in strokes:
                     stroke.clamp_(0, self.config.canvas_size)
             
+            # Add new strokes at intervals (if enabled)
+            if self.config.allow_stroke_addition:
+                if (step > 0 and 
+                    step % self.config.stroke_add_interval == 0 and 
+                    len(strokes) < self.config.max_strokes):
+                    
+                    # Create new stroke
+                    new_stroke = self._create_new_stroke(strokes, self.config.canvas_size)
+                    strokes.append(new_stroke)
+                    
+                    # Add new stroke to optimizer
+                    optimizer.add_param_group({'params': [new_stroke], 'lr': current_lr})
+                    
+                    if self.config.use_tqdm and hasattr(steps_iter, 'set_description'):
+                        steps_iter.set_description(
+                            f"Optimizing → '{self.config.label}' ({len(strokes)} strokes)"
+                        )
+            
             # Record history
             loss_history["total"].append(total_loss.item())
             loss_history["semantic"].append(losses.get("semantic", torch.tensor(0.0)).item())
             loss_history["exemplar"].append(losses.get("exemplar", torch.tensor(0.0)).item())
+            loss_history["reference"].append(losses.get("reference", torch.tensor(0.0)).item())
             loss_history["stroke"].append(losses.get("stroke", torch.tensor(0.0)).item())
             loss_history["tv"].append(losses.get("tv", torch.tensor(0.0)).item())
             loss_history["original"].append(losses.get("original", torch.tensor(0.0)).item())
@@ -434,6 +576,7 @@ class InverseClipassoOptimizer:
                 self.config.loss_weights.get("original", 0.0) if self.config.refinement_mode else 0.0
             )
             loss_history["lr"].append(current_lr)
+            loss_history["num_strokes"].append(len(strokes))
             
             # Compute similarity for tracking
             with torch.no_grad():
@@ -449,6 +592,8 @@ class InverseClipassoOptimizer:
                 }
                 if self.config.refinement_mode:
                     postfix['ow'] = f'{self.config.loss_weights.get("original", 0):.3f}'
+                if self.config.allow_stroke_addition:
+                    postfix['strokes'] = len(strokes)
                 steps_iter.set_postfix(postfix)
             
             # Callback

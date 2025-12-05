@@ -137,6 +137,9 @@ def original_strokes_loss(
     Without this, the optimizer will destroy the sketch trying to match
     a generic text concept.
     
+    Note: Only compares the first min(len(current), len(original)) strokes,
+    so newly added strokes are not penalized.
+    
     Args:
         current_strokes: Current stroke positions (being optimized).
         original_strokes: Original stroke positions (fixed reference).
@@ -144,15 +147,16 @@ def original_strokes_loss(
     Returns:
         Mean squared deviation from original positions.
     """
-    if len(current_strokes) != len(original_strokes):
-        raise ValueError(
-            f"Stroke count mismatch: {len(current_strokes)} vs {len(original_strokes)}"
-        )
+    # Only compare the original strokes (ignore newly added ones)
+    n_compare = min(len(current_strokes), len(original_strokes))
+    
+    if n_compare == 0:
+        return torch.tensor(0.0, device=current_strokes[0].device if current_strokes else 'cpu')
     
     total_loss = torch.tensor(0.0, device=current_strokes[0].device)
     n_points = 0
     
-    for curr, orig in zip(current_strokes, original_strokes):
+    for curr, orig in zip(current_strokes[:n_compare], original_strokes[:n_compare]):
         if curr.shape != orig.shape:
             # Skip mismatched strokes
             continue
@@ -166,6 +170,30 @@ def original_strokes_loss(
         total_loss = total_loss / n_points
     
     return total_loss
+
+
+def reference_image_loss(
+    current_embedding: torch.Tensor,
+    reference_embedding: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Guide the sketch toward a reference image (e.g., a perfect sketch).
+    
+    This is the KEY insight for sketch refinement:
+    - Instead of optimizing toward generic text like "a fish"
+    - We optimize toward what a PERFECT fish sketch looks like
+    - This is the INVERSE of CLIPasso (photo→sketch becomes bad_sketch→good_sketch)
+    
+    Args:
+        current_embedding: CLIP embedding of current sketch [1, D] or [B, D].
+        reference_embedding: CLIP embedding of the reference image [1, D].
+    
+    Returns:
+        Loss value (1 - cosine_similarity). Lower = more similar to reference.
+    """
+    return 1.0 - torch.nn.functional.cosine_similarity(
+        current_embedding, reference_embedding
+    )
 
 
 def exemplar_loss(

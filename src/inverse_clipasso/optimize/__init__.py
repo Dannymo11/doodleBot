@@ -9,4 +9,5 @@ from .losses import (
     aggregate_losses,
     original_strokes_loss,
     exemplar_loss,
+    reference_image_loss,
 )

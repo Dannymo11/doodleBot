@@ -94,6 +94,131 @@ def load_quickdraw_exemplars(
     return exemplar_embeddings
 
 
+def load_reference_image(
+    image_path: str,
+    clip_model: ClipModel,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    Load a reference image (e.g., a perfect sketch) and encode it with CLIP.
+    
+    This is the KEY for sketch refinement:
+    - Instead of optimizing toward generic text like "a fish"
+    - We optimize toward what a PERFECT fish sketch looks like
+    - This is the INVERSE of CLIPasso (photo→sketch becomes bad_sketch→good_sketch)
+    
+    Args:
+        image_path: Path to the reference image (e.g., perfectFish.jpeg)
+        clip_model: CLIP model for encoding
+        device: Device for tensors
+    
+    Returns:
+        CLIP embedding of the reference image [1, D]
+    """
+    from torchvision import transforms
+    
+    # Load the image
+    img = Image.open(image_path).convert("RGB")
+    
+    # Preprocess for CLIP (resize to 224x224, normalize)
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        ),
+    ])
+    
+    img_tensor = preprocess(img).unsqueeze(0).to(device)
+    
+    # Encode with CLIP
+    with torch.no_grad():
+        embedding = clip_model.encode_image(img_tensor, requires_grad=False)
+    
+    print(f"  Reference image embedding shape: {embedding.shape}")
+    print(f"  Loaded reference: {image_path}")
+    
+    return embedding
+
+
+def load_photo_exemplars(
+    image_dir: str,
+    clip_model: ClipModel,
+    device: str = "cpu",
+    max_images: int = 50,
+) -> torch.Tensor:
+    """
+    Load real photos from a directory and encode them with CLIP as exemplars.
+    
+    This lets you guide the sketch toward what REAL fish/cats/etc look like,
+    using the rich semantic understanding CLIP learned from photos.
+    
+    Args:
+        image_dir: Directory containing photos (jpg, png, jpeg)
+        clip_model: CLIP model for encoding
+        device: Device for tensors
+        max_images: Maximum number of images to load
+    
+    Returns:
+        Tensor of CLIP embeddings [N, D]
+    """
+    from torchvision import transforms
+    
+    image_dir = Path(image_dir)
+    if not image_dir.exists():
+        print(f"Warning: {image_dir} not found, returning None")
+        return None
+    
+    # Find all images
+    extensions = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
+    image_paths = []
+    for ext in extensions:
+        image_paths.extend(image_dir.glob(ext))
+    
+    if not image_paths:
+        print(f"Warning: No images found in {image_dir}")
+        return None
+    
+    # Limit number of images
+    if len(image_paths) > max_images:
+        image_paths = random.sample(image_paths, max_images)
+    
+    print(f"  Loading {len(image_paths)} photo exemplars from '{image_dir}'...")
+    
+    # CLIP preprocessing
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        ),
+    ])
+    
+    # Encode each image
+    embeddings = []
+    for img_path in image_paths:
+        try:
+            img = Image.open(img_path).convert("RGB")
+            img_tensor = preprocess(img).unsqueeze(0).to(device)
+            
+            with torch.no_grad():
+                emb = clip_model.encode_image(img_tensor, requires_grad=False)
+            embeddings.append(emb)
+        except Exception as e:
+            print(f"    Skipping {img_path.name}: {e}")
+    
+    if not embeddings:
+        return None
+    
+    # Stack into single tensor
+    photo_embeddings = torch.cat(embeddings, dim=0)
+    print(f"  Photo exemplar embeddings shape: {photo_embeddings.shape}")
+    
+    return photo_embeddings
+
+
 def quickdraw_to_stroke_params(drawing, size=224, padding=10, device="cpu"):
     """Convert QuickDraw drawing to list of stroke parameter tensors."""
     xs_all = []
@@ -220,12 +345,26 @@ def run_long_optimization(
     original_weight=0.5,
     original_weight_schedule="constant",  # "constant", "linear_up", "cosine_up"
     original_weight_start=0.1,  # Starting weight (for scheduled modes)
-    # Exemplar-guided refinement
+    # Exemplar-guided refinement (QuickDraw sketches)
     use_exemplar_loss=False,
     exemplar_category=None,  # QuickDraw category for exemplars
     n_exemplars=20,          # Number of exemplar sketches
     exemplar_weight=0.5,     # Weight for exemplar loss
     exemplar_mode="mean",    # "mean", "min", "softmin"
+    # Photo exemplar guidance (real photos instead of sketches)
+    use_photo_exemplars=False,
+    photo_exemplar_dir=None,  # Directory with real photos (e.g., "data/photos/fish/")
+    photo_exemplar_weight=0.5,  # Weight for photo exemplar loss
+    # Reference image guidance (use a perfect sketch as target)
+    use_reference_image=False,
+    reference_image_path=None,  # Path to perfect sketch (e.g., perfectFish.jpeg)
+    reference_image_weight=1.0,  # Weight for reference image loss
+    # Stroke addition during optimization
+    allow_stroke_addition=False,
+    stroke_add_interval=200,  # Add stroke every N steps
+    max_strokes=20,           # Maximum strokes to add
+    new_stroke_points=4,      # Control points per new stroke
+    stroke_init_mode="random",  # "random", "center", "edge"
 ):
     """
     Run a long optimization and capture snapshots.
@@ -268,14 +407,20 @@ def run_long_optimization(
     if refinement_mode:
         print(f"  Original weight: {original_weight_start} → {original_weight} ({original_weight_schedule})")
     if use_exemplar_loss:
-        print(f"  Exemplar loss: {exemplar_category} ({n_exemplars} samples, weight={exemplar_weight}, mode={exemplar_mode})")
+        print(f"  Sketch exemplar loss: {exemplar_category} ({n_exemplars} samples, weight={exemplar_weight}, mode={exemplar_mode})")
+    if use_photo_exemplars:
+        print(f"  Photo exemplar loss: {photo_exemplar_dir} (weight={photo_exemplar_weight}, mode={exemplar_mode})")
+    if use_reference_image:
+        print(f"  Reference image: {reference_image_path} (weight={reference_image_weight})")
+    if allow_stroke_addition:
+        print(f"  Stroke addition: every {stroke_add_interval} steps, max {max_strokes} strokes ({stroke_init_mode})")
     print(f"  Device: {device}")
     
     # Load CLIP
     print("  Loading CLIP model...")
     clip_model = ClipModel(device=device, use_float32=True)
     
-    # Load exemplar embeddings if requested
+    # Load exemplar embeddings if requested (QuickDraw sketches)
     exemplar_embeddings = None
     if use_exemplar_loss and exemplar_category:
         exemplar_embeddings = load_quickdraw_exemplars(
@@ -286,14 +431,40 @@ def run_long_optimization(
             device=device,
         )
     
+    # Load photo exemplar embeddings if requested (real photos)
+    if use_photo_exemplars and photo_exemplar_dir:
+        photo_embeddings = load_photo_exemplars(
+            image_dir=photo_exemplar_dir,
+            clip_model=clip_model,
+            device=device,
+        )
+        # Combine with sketch exemplars if both are used, otherwise use photo embeddings
+        if exemplar_embeddings is not None and photo_embeddings is not None:
+            print(f"  Combining {exemplar_embeddings.shape[0]} sketch + {photo_embeddings.shape[0]} photo exemplars")
+            exemplar_embeddings = torch.cat([exemplar_embeddings, photo_embeddings], dim=0)
+        elif photo_embeddings is not None:
+            exemplar_embeddings = photo_embeddings
+    
+    # Load reference image embedding if requested
+    reference_image_embedding = None
+    if use_reference_image and reference_image_path:
+        reference_image_embedding = load_reference_image(
+            image_path=reference_image_path,
+            clip_model=clip_model,
+            device=device,
+        )
+    
     # Build loss weights
     loss_weights = {
-        "semantic": 1.0,
+        "semantic": 0.5 if use_reference_image else 1.0,  # Reduce semantic if using reference
         "stroke": 0.05,
         "tv": 0.001,
     }
-    if use_exemplar_loss:
-        loss_weights["exemplar"] = exemplar_weight
+    if use_exemplar_loss or use_photo_exemplars:
+        # Use photo weight if using photos, otherwise sketch weight
+        loss_weights["exemplar"] = photo_exemplar_weight if use_photo_exemplars else exemplar_weight
+    if use_reference_image:
+        loss_weights["reference"] = reference_image_weight
     
     # Configure optimization
     config = OptimizationConfig(
@@ -314,11 +485,21 @@ def run_long_optimization(
         original_weight=original_weight,
         original_weight_schedule=original_weight_schedule,
         original_weight_start=original_weight_start,
-        # Exemplar settings
-        use_exemplar_loss=use_exemplar_loss,
+        # Exemplar settings (works for both sketch and photo exemplars)
+        use_exemplar_loss=use_exemplar_loss or use_photo_exemplars,
         exemplar_embeddings=exemplar_embeddings,
-        exemplar_weight=exemplar_weight,
+        exemplar_weight=photo_exemplar_weight if use_photo_exemplars else exemplar_weight,
         exemplar_mode=exemplar_mode,
+        # Reference image settings
+        use_reference_image=use_reference_image,
+        reference_image_embedding=reference_image_embedding,
+        reference_image_weight=reference_image_weight,
+        # Stroke addition settings
+        allow_stroke_addition=allow_stroke_addition,
+        stroke_add_interval=stroke_add_interval,
+        max_strokes=max_strokes,
+        new_stroke_points=new_stroke_points,
+        stroke_init_mode=stroke_init_mode,
     )
     
     # Callback to capture snapshots
@@ -346,6 +527,7 @@ def run_long_optimization(
     print(f"    Final similarity: {result.final_similarity:.1%}")
     print(f"    Improvement: {(result.final_similarity - snapshots[0][1]):.1%}")
     print(f"    Captured {len(snapshots)} snapshots")
+    print(f"    Final strokes: {len(result.final_strokes)}")
     
     return result, snapshots
 
@@ -488,8 +670,21 @@ def main():
     else:
         print(f"\n🔄 TRANSFORMATION MODE: Converting '{source_label}' → '{target_label}'")
     
-    # Extract the category name for exemplar loading
-    exemplar_category = source_label  # e.g., "fish" for fish → fish refinement
+    # Check if we have a perfect reference image for this category
+    reference_image_path = Path(PROJECT_ROOT) / f"perfect{source_label.capitalize()}.jpeg"
+    has_reference_image = reference_image_path.exists()
+    
+    # Check if we have a directory of real photos for this category
+    photo_dir = Path(PROJECT_ROOT) / "data" / "photos" / source_label
+    has_photo_exemplars = photo_dir.exists() and any(photo_dir.glob("*"))
+    
+    if has_reference_image:
+        print(f"\n✨ Found reference image: {reference_image_path}")
+        print("   Using REFERENCE IMAGE GUIDANCE (inverse CLIPasso approach)")
+    
+    if has_photo_exemplars:
+        print(f"\n📷 Found photo exemplars: {photo_dir}")
+        print("   Using REAL PHOTOS to guide toward realistic semantics")
     
     # Run optimization with appropriate settings
     result, snapshots = run_long_optimization(
@@ -502,16 +697,30 @@ def main():
         lr=2.5 if is_refinement else 3.0,            # Higher LR for faster initial progress
         use_multi_prompt=True,                        # Always use multi-prompt now!
         refinement_mode=is_refinement,                # Preserve original when refining
-        # SCHEDULED ORIGINAL WEIGHT: Start low (more CLIP exploration), end high (lock structure)
-        original_weight=0.5 if is_refinement else 0,  # Reduced since exemplar loss helps
+        # SCHEDULED ORIGINAL WEIGHT: Start low (more exploration), end high (lock structure)
+        original_weight=0.3 if is_refinement else 0,  # Reduced since reference loss helps
         original_weight_schedule="cosine_up" if is_refinement else "constant",
-        original_weight_start=0.05,                   # Start very low to allow CLIP exploration!
-        # EXEMPLAR LOSS: Guide toward "good sketches" from QuickDraw
-        use_exemplar_loss=is_refinement,              # Use exemplar loss for refinement
-        exemplar_category=exemplar_category,          # Load exemplars from same category
-        n_exemplars=30,                               # Number of reference sketches
-        exemplar_weight=1.0,                          # Strong pull toward good examples
-        exemplar_mode="softmin",                      # Pull toward nearest good examples
+        original_weight_start=0.02,                   # Start very low to allow exploration!
+        # REFERENCE IMAGE: Guide toward a perfect sketch (inverse CLIPasso)
+        use_reference_image=has_reference_image and is_refinement,
+        reference_image_path=str(reference_image_path) if has_reference_image else None,
+        reference_image_weight=2.0,                   # Strong pull toward perfect sketch
+        # PHOTO EXEMPLARS: Guide toward real photos (rich semantics)
+        use_photo_exemplars=has_photo_exemplars,
+        photo_exemplar_dir=str(photo_dir) if has_photo_exemplars else None,
+        photo_exemplar_weight=0.5,                    # Balance with text-based semantic loss
+        # Disable QuickDraw sketch exemplars (using photos or reference image instead)
+        use_exemplar_loss=False,
+        exemplar_category=None,
+        n_exemplars=0,
+        exemplar_weight=0.0,
+        exemplar_mode="mean",
+        # STROKE ADDITION: Allow adding strokes during optimization
+        allow_stroke_addition=True,     # Enable adding strokes!
+        stroke_add_interval=200,        # Add a stroke every 200 steps
+        max_strokes=12,                 # Cap at 12 strokes total
+        new_stroke_points=5,            # 5 control points per new stroke
+        stroke_init_mode="random",      # Random placement of new strokes
     )
     
     # Create visualizations
@@ -526,6 +735,7 @@ def main():
     print(f"  🎬 Animation: {gif_path}")
     print(f"  📈 Summary plot: {plot_path}")
     print(f"\nFinal similarity: {result.final_similarity:.1%}")
+    print(f"Final strokes: {len(result.final_strokes)}")
 
 
 if __name__ == "__main__":
