@@ -365,6 +365,11 @@ def run_long_optimization(
     max_strokes=20,           # Maximum strokes to add
     new_stroke_points=4,      # Control points per new stroke
     stroke_init_mode="random",  # "random", "center", "edge"
+    # ===== CLIPasso-style features =====
+    use_bezier=False,         # Use Bézier curves for smoother strokes
+    bezier_samples=50,        # Points to sample per Bézier curve
+    use_augmentations=False,  # Apply augmentations during CLIP encoding
+    num_augments=4,           # Number of augmented views
 ):
     """
     Run a long optimization and capture snapshots.
@@ -414,6 +419,10 @@ def run_long_optimization(
         print(f"  Reference image: {reference_image_path} (weight={reference_image_weight})")
     if allow_stroke_addition:
         print(f"  Stroke addition: every {stroke_add_interval} steps, max {max_strokes} strokes ({stroke_init_mode})")
+    if use_bezier:
+        print(f"  🔷 Bézier curves: ENABLED ({bezier_samples} samples)")
+    if use_augmentations:
+        print(f"  🔄 Augmentations: ENABLED ({num_augments} views)")
     print(f"  Device: {device}")
     
     # Load CLIP
@@ -497,6 +506,11 @@ def run_long_optimization(
         reference_image_weight=reference_image_weight,
         # Stroke addition settings
         allow_stroke_addition=allow_stroke_addition,
+        # CLIPasso-style features
+        use_bezier=use_bezier,
+        bezier_samples=bezier_samples,
+        use_augmentations=use_augmentations,
+        num_augments=num_augments,
         stroke_add_interval=stroke_add_interval,
         max_strokes=max_strokes,
         new_stroke_points=new_stroke_points,
@@ -692,7 +706,7 @@ def main():
         init_strokes=init_strokes,
         target_label=target_label,
         source_label=source_label,
-        steps=1500,                                   # More steps for better convergence
+        steps=200,                                   # More steps for better convergence
         snapshot_every=50,
         noise_scale=0.3 if is_refinement else 0.4,   # Moderate noise for exploration
         lr=2.5 if is_refinement else 3.0,            # Higher LR for faster initial progress
@@ -721,7 +735,12 @@ def main():
         stroke_add_interval=200,
         max_strokes=12,
         new_stroke_points=5,
-        stroke_init_mode="random"
+        stroke_init_mode="random",
+        # ===== CLIPasso-style features =====
+        use_bezier=True,           # 🔷 ENABLED - smoother Bézier curves!
+        bezier_samples=50,         # Points per curve
+        use_augmentations=True,    # 🔄 ENABLED - robust CLIP guidance!
+        num_augments=4,            # Number of augmented views
     )
     
     # Create visualizations

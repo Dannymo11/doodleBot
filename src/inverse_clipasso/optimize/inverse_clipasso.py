@@ -7,15 +7,21 @@ This implements the core "inverse CLIPasso" loop:
 3. Compute semantic loss against target text
 4. Backpropagate to stroke parameters
 5. Update strokes via gradient descent
+
+Now with CLIPasso-style features:
+- Bézier curve representation (smoother strokes)
+- Augmentations during CLIP encoding (more robust optimization)
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Iterator, Optional, Callable
+from typing import Dict, List, Iterator, Optional, Callable, Tuple
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.inverse_clipasso.clip.clip_api import ClipModel
@@ -133,13 +139,13 @@ class OptimizationConfig:
     """How to aggregate exemplar similarities: 'mean', 'min', 'softmin'."""
     
     # Reference image guidance (use a perfect sketch as target)
-    use_reference_image: bool = False
+    use_reference_image: bool = True
     """If True, guides optimization toward a reference image embedding."""
     
     reference_image_embedding: Optional[torch.Tensor] = None
     """Pre-computed CLIP embedding of the reference image [1, D]."""
     
-    reference_image_weight: float = 1.0
+    reference_image_weight: float = 2.0
     """Weight for reference image loss (how strongly to pull toward the reference)."""
     
     blend_text_and_reference: bool = False
@@ -163,6 +169,31 @@ class OptimizationConfig:
     
     stroke_init_mode: str = "random"
     """How to initialize new strokes: 'random', 'center', 'edge'."""
+    
+    # ===== CLIPasso-style features =====
+    
+    # Bézier curves
+    use_bezier: bool = False
+    """If True, converts strokes to Bézier curves for smoother optimization."""
+    
+    bezier_samples: int = 50
+    """Number of points to sample per Bézier curve when rendering."""
+    
+    # Augmentations (KEY for robust CLIP guidance)
+    use_augmentations: bool = False
+    """If True, applies random augmentations during CLIP encoding."""
+    
+    num_augments: int = 4
+    """Number of augmented views to generate (including original)."""
+    
+    augment_crop_scale: Tuple[float, float] = (0.7, 1.0)
+    """Scale range for random crops."""
+    
+    augment_perspective: float = 0.15
+    """Maximum perspective distortion."""
+    
+    augment_rotation: float = 10.0
+    """Maximum rotation in degrees."""
 
 
 @dataclass
@@ -216,6 +247,20 @@ class InverseClipassoOptimizer:
         # Setup CLIP normalization tensors
         self._clip_mean = CLIP_MEAN.view(1, 3, 1, 1).to(self.device)
         self._clip_std = CLIP_STD.view(1, 3, 1, 1).to(self.device)
+        
+        # Setup augmenter if enabled
+        self.augmenter = None
+        if config.use_augmentations:
+            from src.inverse_clipasso.optimize.augmentations import CLIPAugmentations
+            self.augmenter = CLIPAugmentations(
+                num_augments=config.num_augments,
+                crop_scale=config.augment_crop_scale,
+                perspective_scale=config.augment_perspective,
+                rotation_degrees=config.augment_rotation,
+            )
+        
+        # Setup Bézier sketch if enabled
+        self._bezier_sketch = None
     
     @property
     def target_embedding(self) -> torch.Tensor:
@@ -386,6 +431,90 @@ class InverseClipassoOptimizer:
         
         return points.to(self.device).requires_grad_(True)
     
+    def _polyline_to_bezier_points(self, polyline: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a polyline to cubic Bézier control points.
+        
+        Takes a polyline [N, 2] and returns 4 control points [4, 2] for a cubic Bézier.
+        """
+        n_points = polyline.shape[0]
+        
+        if n_points >= 4:
+            # Sample 4 evenly-spaced points
+            indices = torch.linspace(0, n_points - 1, 4).long()
+            return polyline[indices]
+        elif n_points == 3:
+            # Duplicate middle point
+            return torch.stack([
+                polyline[0],
+                polyline[1],
+                polyline[1],
+                polyline[2],
+            ])
+        elif n_points == 2:
+            # Create control points between endpoints
+            p0, p1 = polyline[0], polyline[1]
+            return torch.stack([
+                p0,
+                p0 + (p1 - p0) * 0.33,
+                p0 + (p1 - p0) * 0.67,
+                p1,
+            ])
+        else:
+            # Single point - create small curve
+            p = polyline[0]
+            offset = torch.tensor([10.0, 10.0], device=polyline.device)
+            return torch.stack([p - offset, p - offset * 0.5, p + offset * 0.5, p + offset])
+    
+    def _sample_bezier_curve(self, control_points: torch.Tensor, num_samples: int = 50) -> torch.Tensor:
+        """
+        Sample points along a cubic Bézier curve.
+        
+        Args:
+            control_points: [4, 2] tensor of control points P0, P1, P2, P3
+            num_samples: Number of points to sample
+        
+        Returns:
+            [num_samples, 2] tensor of sampled points
+        """
+        device = control_points.device
+        t = torch.linspace(0, 1, num_samples, device=device).unsqueeze(1)  # [N, 1]
+        
+        P0, P1, P2, P3 = control_points[0], control_points[1], control_points[2], control_points[3]
+        
+        # Cubic Bézier formula: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+        points = (
+            (1 - t) ** 3 * P0 +
+            3 * (1 - t) ** 2 * t * P1 +
+            3 * (1 - t) * t ** 2 * P2 +
+            t ** 3 * P3
+        )
+        
+        return points
+    
+    def _render_with_bezier(self, bezier_controls: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Render Bézier control points by sampling curves and rendering as polylines.
+        
+        Args:
+            bezier_controls: List of [4, 2] Bézier control point tensors
+        
+        Returns:
+            Rendered image [1, 3, H, W]
+        """
+        # Sample each Bézier curve to get polylines
+        polylines = []
+        for controls in bezier_controls:
+            sampled = self._sample_bezier_curve(controls, self.config.bezier_samples)
+            polylines.append(sampled)
+        
+        # Render the sampled polylines
+        return render_strokes_rgb(
+            polylines,
+            canvas_size=self.config.canvas_size,
+            stroke_width=self.config.stroke_width,
+        )
+    
     def _compute_losses(
         self, 
         strokes: List[torch.Tensor],
@@ -396,7 +525,7 @@ class InverseClipassoOptimizer:
         Compute all loss terms.
         
         Args:
-            strokes: List of stroke parameter tensors.
+            strokes: List of stroke parameter tensors (polylines or Bézier controls).
             rendered_image: Rendered RGB image [1, 3, H, W].
             original_strokes: Original stroke positions (for refinement mode).
         
@@ -405,9 +534,18 @@ class InverseClipassoOptimizer:
         """
         losses = {}
         
-        # Semantic loss (CLIP alignment)
+        # Semantic loss (CLIP alignment) - with optional augmentations
         img_normalized = self._normalize_for_clip(rendered_image)
-        img_embedding = self.clip.encode_image(img_normalized, requires_grad=True)
+        
+        if self.augmenter is not None:
+            # Apply augmentations for more robust CLIP guidance
+            augmented = self.augmenter(img_normalized)  # [N, 3, H, W]
+            img_embeddings = self.clip.encode_image(augmented, requires_grad=True)
+            # Average embeddings across augmentations
+            img_embedding = img_embeddings.mean(dim=0, keepdim=True)
+        else:
+            img_embedding = self.clip.encode_image(img_normalized, requires_grad=True)
+        
         losses["semantic"] = semantic_loss(img_embedding, self.target_embedding).mean()
         
         # Exemplar loss (guide toward good reference sketches)
@@ -426,8 +564,14 @@ class InverseClipassoOptimizer:
             ).mean()
         
         # Stroke regularization (smoothness + length)
+        # For Bézier, we regularize the control points directly
         if self.config.loss_weights.get("stroke", 0) > 0:
-            losses["stroke"] = stroke_regularizer(strokes)
+            if self.config.use_bezier:
+                # For Bézier, sample curves first then regularize
+                polylines = [self._sample_bezier_curve(s, 20) for s in strokes]
+                losses["stroke"] = stroke_regularizer(polylines)
+            else:
+                losses["stroke"] = stroke_regularizer(strokes)
         
         # Total variation (image smoothness)
         if self.config.loss_weights.get("tv", 0) > 0:
@@ -455,12 +599,23 @@ class InverseClipassoOptimizer:
         Returns:
             OptimizationResult with final strokes and loss history.
         """
-        # Clone strokes and ensure they require gradients
-        strokes = []
-        for s in init_strokes:
-            stroke = s.clone().detach().to(self.device)
-            stroke.requires_grad_(True)
-            strokes.append(stroke)
+        # Convert to Bézier control points if enabled
+        if self.config.use_bezier:
+            strokes = []
+            for s in init_strokes:
+                stroke = s.clone().detach().to(self.device)
+                # Convert polyline to Bézier control points [4, 2]
+                bezier_controls = self._polyline_to_bezier_points(stroke)
+                bezier_controls.requires_grad_(True)
+                strokes.append(bezier_controls)
+            print(f"  ✅ Converted {len(strokes)} strokes to Bézier curves")
+        else:
+            # Clone strokes and ensure they require gradients
+            strokes = []
+            for s in init_strokes:
+                stroke = s.clone().detach().to(self.device)
+                stroke.requires_grad_(True)
+                strokes.append(stroke)
         
         # Save original strokes for refinement mode (detached, no grad)
         original_strokes: Optional[List[torch.Tensor]] = None
@@ -491,10 +646,20 @@ class InverseClipassoOptimizer:
         # Noise tracking
         current_noise_scale = self.config.noise_scale
         
+        # Log CLIPasso features
+        if self.config.use_augmentations:
+            print(f"  ✅ Augmentations enabled ({self.config.num_augments} views)")
+        
         # Progress bar
+        desc = f"Optimizing → '{self.config.label}'"
+        if self.config.use_bezier:
+            desc += " [Bézier]"
+        if self.config.use_augmentations:
+            desc += " [Aug]"
+        
         steps_iter = range(self.config.steps)
         if self.config.use_tqdm:
-            steps_iter = tqdm(steps_iter, desc=f"Optimizing → '{self.config.label}'")
+            steps_iter = tqdm(steps_iter, desc=desc)
         
         # Main optimization loop
         for step in steps_iter:
@@ -511,11 +676,14 @@ class InverseClipassoOptimizer:
             optimizer.zero_grad()
             
             # Render strokes to image
-            rendered = render_strokes_rgb(
-                strokes,
-                canvas_size=self.config.canvas_size,
-                stroke_width=self.config.stroke_width,
-            )
+            if self.config.use_bezier:
+                rendered = self._render_with_bezier(strokes)
+            else:
+                rendered = render_strokes_rgb(
+                    strokes,
+                    canvas_size=self.config.canvas_size,
+                    stroke_width=self.config.stroke_width,
+                )
             
             # Compute losses
             losses = self._compute_losses(strokes, rendered, original_strokes)
@@ -607,7 +775,17 @@ class InverseClipassoOptimizer:
                 self._save_checkpoint(step, strokes, loss_history)
         
         # Detach final strokes
-        final_strokes = [s.detach().clone() for s in strokes]
+        if self.config.use_bezier:
+            # Convert Bézier control points back to polylines for consistent output
+            final_strokes = []
+            for bezier_controls in strokes:
+                polyline = self._sample_bezier_curve(
+                    bezier_controls.detach(), 
+                    self.config.bezier_samples
+                )
+                final_strokes.append(polyline.clone())
+        else:
+            final_strokes = [s.detach().clone() for s in strokes]
         
         return OptimizationResult(
             final_strokes=final_strokes,
