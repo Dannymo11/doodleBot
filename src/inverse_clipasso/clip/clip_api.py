@@ -32,7 +32,7 @@ class ClipModel:
         self.device = device
         self.model, self.preprocess = clip.load(model_name, device=device, jit=False)
         self.model.eval()
-        
+
         # CLIP uses float16 by default on GPU, which can break gradient flow.
         # Convert to float32 if we need gradients for optimization.
         if use_float32:
@@ -62,7 +62,7 @@ class ClipModel:
             emb = self.model.encode_image(img_input)
         else:
             # No gradients for inference (faster, less memory)
-            with torch.no_grad():
+        with torch.no_grad():
                 emb = self.model.encode_image(img_input)
         
         # Always return float32 for consistent downstream operations
