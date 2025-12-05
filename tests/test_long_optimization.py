@@ -455,10 +455,11 @@ def run_long_optimization(
         )
     
     # Build loss weights
+    # SEMANTIC is the CLIP text embedding loss - increase to emphasize text more
     loss_weights = {
-        "semantic": 0.5 if use_reference_image else 1.0,  # Reduce semantic if using reference
-        "stroke": 0.05,
-        "tv": 0.001,
+        "semantic": 3.0,  # HIGH weight for CLIP text guidance (was 1.0)
+        "stroke": 0.01,   # Lower regularization to allow more freedom
+        "tv": 0.0005,     # Lower TV to allow more changes
     }
     if use_exemplar_loss or use_photo_exemplars:
         # Use photo weight if using photos, otherwise sketch weight
@@ -473,7 +474,7 @@ def run_long_optimization(
         lr=lr,
         lr_schedule="warmup_cosine",
         warmup_steps=min(100, steps // 10),
-        min_lr=0.05,
+        min_lr=0.5,  # Higher min LR - less decay (was 0.05)
         noise_scale=noise_scale,
         noise_decay=0.995,
         loss_weights=loss_weights,
@@ -656,7 +657,7 @@ def main():
         init_strokes = quickdraw_to_stroke_params(drawing, device=device)
         
         # Choose target
-        target_label = "A perfect sketch of a fish"  # Refine fish into a better fish
+        target_label = "a perfect sketch of a fish"  
     
     print(f"\nSource: {source_label}")
     print(f"Target: {target_label}")
@@ -697,14 +698,14 @@ def main():
         lr=2.5 if is_refinement else 3.0,            # Higher LR for faster initial progress
         use_multi_prompt=True,                        # Always use multi-prompt now!
         refinement_mode=is_refinement,                # Preserve original when refining
-        # SCHEDULED ORIGINAL WEIGHT: Start low (more exploration), end high (lock structure)
-        original_weight=0.3 if is_refinement else 0,  # Reduced since reference loss helps
-        original_weight_schedule="cosine_up" if is_refinement else "constant",
-        original_weight_start=0.02,                   # Start very low to allow exploration!
-        # REFERENCE IMAGE: Guide toward a perfect sketch (inverse CLIPasso)
-        use_reference_image=has_reference_image and is_refinement,
-        reference_image_path=str(reference_image_path) if has_reference_image else None,
-        reference_image_weight=2.0,                   # Strong pull toward perfect sketch
+        # ORIGINAL WEIGHT: Lower = more freedom for CLIP text to change the sketch
+        original_weight=0.1 if is_refinement else 0,  # LOW - let text dominate!
+        original_weight_schedule="constant",          # Keep it low throughout
+        original_weight_start=0.05,                   # Start very low
+        # REFERENCE IMAGE: Disabled to let text dominate
+        use_reference_image=False,                    # OFF - pure text guidance
+        reference_image_path=None,
+        reference_image_weight=0.0,                   # Unused
         # PHOTO EXEMPLARS: Guide toward real photos (rich semantics)
         use_photo_exemplars=has_photo_exemplars,
         photo_exemplar_dir=str(photo_dir) if has_photo_exemplars else None,
@@ -715,12 +716,12 @@ def main():
         n_exemplars=0,
         exemplar_weight=0.0,
         exemplar_mode="mean",
-        # STROKE ADDITION: Allow adding strokes during optimization
-        allow_stroke_addition=True,     # Enable adding strokes!
-        stroke_add_interval=200,        # Add a stroke every 200 steps
-        max_strokes=12,                 # Cap at 12 strokes total
-        new_stroke_points=5,            # 5 control points per new stroke
-        stroke_init_mode="random",      # Random placement of new strokes
+        # STROKE ADDITION: Disabled - keep original stroke count
+        allow_stroke_addition=False,    # No new strokes
+        stroke_add_interval=200,
+        max_strokes=12,
+        new_stroke_points=5,
+        stroke_init_mode="random"
     )
     
     # Create visualizations
