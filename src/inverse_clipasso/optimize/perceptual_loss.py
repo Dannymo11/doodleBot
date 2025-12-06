@@ -17,12 +17,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+__all__ = [
+    "CLIPFeatureExtractor",
+    "MultiScalePerceptualLoss",
+    "CLIPassoLoss",
+    "compute_clip_loss_with_augmentations",
+]
+
 
 class CLIPFeatureExtractor(nn.Module):
     """
     Extract intermediate features from CLIP's visual encoder.
     
     Works with both ResNet and ViT-based CLIP models.
+    
+    Hooks are registered once in __init__ and kept persistent for efficiency.
+    Features are cleared between forward passes to avoid memory leaks.
     """
     
     def __init__(self, clip_model, layer_indices: Optional[List[int]] = None):
@@ -58,11 +68,15 @@ class CLIPFeatureExtractor(nn.Module):
         # Storage for intermediate features
         self._features: Dict[int, torch.Tensor] = {}
         self._hooks: List = []
+        self._hooks_registered = False
+        
+        # Register hooks once during initialization
+        self._register_hooks()
     
-    def _create_hooks(self):
-        """Create forward hooks to capture intermediate features."""
-        self._clear_hooks()
-        self._features = {}
+    def _register_hooks(self) -> None:
+        """Register forward hooks once (persistent for lifetime of extractor)."""
+        if self._hooks_registered:
+            return
         
         if self.is_vit:
             # Hook into transformer blocks
@@ -78,6 +92,8 @@ class CLIPFeatureExtractor(nn.Module):
                     layer = getattr(self.clip_visual, layer_names[idx])
                     hook = layer.register_forward_hook(self._get_hook(idx))
                     self._hooks.append(hook)
+        
+        self._hooks_registered = True
     
     def _get_hook(self, idx: int):
         """Create a hook function for a specific layer."""
@@ -85,11 +101,20 @@ class CLIPFeatureExtractor(nn.Module):
             self._features[idx] = output
         return hook
     
-    def _clear_hooks(self):
-        """Remove all hooks."""
+    def _clear_features(self) -> None:
+        """Clear stored features to free memory."""
+        self._features = {}
+    
+    def remove_hooks(self) -> None:
+        """Remove all hooks (call when done with extractor)."""
         for hook in self._hooks:
             hook.remove()
         self._hooks = []
+        self._hooks_registered = False
+    
+    def __del__(self):
+        """Cleanup hooks on deletion."""
+        self.remove_hooks()
     
     def forward(self, image: torch.Tensor) -> Dict[int, torch.Tensor]:
         """
@@ -101,19 +126,17 @@ class CLIPFeatureExtractor(nn.Module):
         Returns:
             Dictionary mapping layer index to feature tensor.
         """
-        self._create_hooks()
+        # Clear previous features
+        self._clear_features()
         
-        try:
-            # Run forward pass (features captured by hooks)
-            if self.is_vit:
-                _ = self.clip_visual(image)
-            else:
-                _ = self.clip_visual(image)
-            
-            # Copy features (hooks store references that may be overwritten)
-            features = {k: v.clone() for k, v in self._features.items()}
-        finally:
-            self._clear_hooks()
+        # Run forward pass (features captured by persistent hooks)
+        _ = self.clip_visual(image)
+        
+        # Copy features (hooks store references that may be overwritten)
+        features = {k: v.clone() for k, v in self._features.items()}
+        
+        # Clear to free memory
+        self._clear_features()
         
         return features
 

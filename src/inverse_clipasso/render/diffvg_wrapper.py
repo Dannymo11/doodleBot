@@ -8,7 +8,7 @@ control points, enabling gradient-based optimization.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ def render_strokes_soft(
     samples_per_segment: int = 10,
     background: float = 1.0,
     ink_color: float = 0.0,
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
     Differentiable soft line renderer using Gaussian splatting.
@@ -34,6 +35,7 @@ def render_strokes_soft(
                             control points. More samples = smoother lines.
         background: Background intensity (1.0 = white).
         ink_color: Stroke intensity (0.0 = black).
+        device: Target device. If None, uses device of first stroke param.
     
     Returns:
         torch.Tensor: Shape [1, 1, H, W] grayscale image tensor.
@@ -45,24 +47,34 @@ def render_strokes_soft(
         >>> loss = some_loss(img)
         >>> loss.backward()  # Gradients flow to stroke coordinates!
     """
+    # Determine device and dtype
+    if device is None:
+        if not stroke_params:
+            device = torch.device('cpu')
+        else:
+            device = stroke_params[0].device
+    elif isinstance(device, str):
+        device = torch.device(device)
+    
     if not stroke_params:
-        device = torch.device('cpu')
         dtype = torch.float32
     else:
-        device = stroke_params[0].device
         dtype = stroke_params[0].dtype
     
     # Collect all sample points from all strokes
     all_points = []
     
     for stroke in stroke_params:
+        # Ensure stroke is on correct device
+        if stroke.device != device:
+            stroke = stroke.to(device)
+        
         if stroke.shape[0] < 2:
             continue
         
         # Get segment start and end points
         p1 = stroke[:-1]  # [N-1, 2] start points
         p2 = stroke[1:]   # [N-1, 2] end points
-        n_segments = p1.shape[0]
         
         # Sample points along each segment via linear interpolation
         t = torch.linspace(0, 1, samples_per_segment, device=device, dtype=dtype)
@@ -94,28 +106,51 @@ def render_strokes_soft(
     yy, xx = torch.meshgrid(coords, coords, indexing='ij')  # [H, W] each
     
     # Compute Gaussian splats efficiently
-    # For memory efficiency with large point counts, process in chunks
+    # Use larger chunks on GPU for better parallelization
     sigma = stroke_width / 2.0
     sigma_sq_2 = 2.0 * sigma * sigma
     
-    chunk_size = 1000  # Process points in chunks to manage memory
+    # GPU can handle larger chunks efficiently; CPU benefits from smaller chunks
+    if device.type == 'cuda':
+        chunk_size = 5000  # Larger chunks for GPU parallelization
+    elif device.type == 'mps':
+        chunk_size = 2000  # Medium chunks for Apple Silicon
+    else:
+        chunk_size = 1000  # Smaller chunks for CPU memory management
+    
     ink = torch.zeros(canvas_size, canvas_size, device=device, dtype=dtype)
     
-    for i in range(0, n_points, chunk_size):
-        chunk = all_points[i:i + chunk_size]  # [C, 2]
-        
+    # If total points fit in one chunk, process all at once (most efficient)
+    if n_points <= chunk_size:
         # Extract x, y coordinates and reshape for broadcasting
-        px = chunk[:, 0].view(-1, 1, 1)  # [C, 1, 1]
-        py = chunk[:, 1].view(-1, 1, 1)  # [C, 1, 1]
+        px = all_points[:, 0].view(-1, 1, 1)  # [P, 1, 1]
+        py = all_points[:, 1].view(-1, 1, 1)  # [P, 1, 1]
         
-        # Squared distance from each point to each pixel: [C, H, W]
+        # Squared distance from each point to each pixel: [P, H, W]
         dist_sq = (xx.unsqueeze(0) - px) ** 2 + (yy.unsqueeze(0) - py) ** 2
         
         # Gaussian splat contribution
-        splats = torch.exp(-dist_sq / sigma_sq_2)  # [C, H, W]
+        splats = torch.exp(-dist_sq / sigma_sq_2)  # [P, H, W]
         
-        # Accumulate ink
-        ink = ink + splats.sum(dim=0)
+        # Sum all splats
+        ink = splats.sum(dim=0)
+    else:
+        # Process in chunks for memory management
+        for i in range(0, n_points, chunk_size):
+            chunk = all_points[i:i + chunk_size]  # [C, 2]
+            
+            # Extract x, y coordinates and reshape for broadcasting
+            px = chunk[:, 0].view(-1, 1, 1)  # [C, 1, 1]
+            py = chunk[:, 1].view(-1, 1, 1)  # [C, 1, 1]
+            
+            # Squared distance from each point to each pixel: [C, H, W]
+            dist_sq = (xx.unsqueeze(0) - px) ** 2 + (yy.unsqueeze(0) - py) ** 2
+            
+            # Gaussian splat contribution
+            splats = torch.exp(-dist_sq / sigma_sq_2)  # [C, H, W]
+            
+            # Accumulate ink
+            ink = ink + splats.sum(dim=0)
     
     # Normalize ink to [0, 1] range
     ink_max = ink.max()
@@ -134,6 +169,7 @@ def render_strokes_rgb(
     canvas_size: int = 224,
     stroke_width: float = 3.0,
     samples_per_segment: int = 10,
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
     Render strokes to RGB image (3 channels) for CLIP compatibility.
@@ -146,6 +182,7 @@ def render_strokes_rgb(
         canvas_size: Output size (default 224 for CLIP).
         stroke_width: Line thickness.
         samples_per_segment: Interpolation density.
+        device: Target device. If None, uses device of first stroke param.
     
     Returns:
         torch.Tensor: Shape [1, 3, H, W] RGB image tensor.
@@ -155,6 +192,7 @@ def render_strokes_rgb(
         canvas_size=canvas_size,
         stroke_width=stroke_width,
         samples_per_segment=samples_per_segment,
+        device=device,
     )  # [1, 1, H, W]
     
     # Expand grayscale to RGB by repeating across channel dimension

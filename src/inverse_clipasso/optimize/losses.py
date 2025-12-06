@@ -8,6 +8,17 @@ from typing import Dict, List, Union
 
 import torch
 
+__all__ = [
+    "semantic_loss",
+    "style_loss",
+    "stroke_regularizer",
+    "total_variation",
+    "original_strokes_loss",
+    "reference_image_loss",
+    "exemplar_loss",
+    "aggregate_losses",
+]
+
 
 def semantic_loss(image_embed: torch.Tensor, text_embed: torch.Tensor) -> torch.Tensor:
     """

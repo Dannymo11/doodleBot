@@ -35,11 +35,21 @@ from src.inverse_clipasso.optimize.losses import (
     exemplar_loss,
     reference_image_loss,
 )
-
-
-# CLIP normalization constants
-CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073])
-CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711])
+from src.inverse_clipasso.optimize.common import (
+    CLIP_MEAN,
+    CLIP_STD,
+    STROKE_RADIUS_MIN,
+    STROKE_RADIUS_MAX,
+    SINGLE_POINT_OFFSET,
+    STROKE_INIT_PADDING,
+    get_lr_multiplier,
+    get_scheduled_weight,
+    sample_bezier_curve,
+    polyline_to_bezier,
+    polyline_to_bezier_segments,
+    create_random_stroke,
+    add_gradient_noise,
+)
 
 
 @dataclass
@@ -179,6 +189,13 @@ class OptimizationConfig:
     bezier_samples: int = 50
     """Number of points to sample per Bézier curve when rendering."""
     
+    bezier_multi_segment: bool = True
+    """If True, splits long strokes into multiple Bézier curves for better fidelity."""
+    
+    bezier_max_points_per_segment: int = 6
+    """Max points per Bézier segment when using multi-segment mode.
+    Smaller = more segments = higher fidelity but more parameters to optimize."""
+    
     # Augmentations (KEY for robust CLIP guidance)
     use_augmentations: bool = False
     """If True, applies random augmentations during CLIP encoding."""
@@ -283,39 +300,14 @@ class InverseClipassoOptimizer:
     
     def _get_lr(self, step: int) -> float:
         """Compute learning rate for current step based on schedule."""
-        total_steps = self.config.steps
-        base_lr = self.config.lr
-        min_lr = self.config.min_lr
-        warmup_steps = self.config.warmup_steps
-        schedule = self.config.lr_schedule
-        
-        if schedule == "constant":
-            return base_lr
-        
-        elif schedule == "linear":
-            # Linear decay from base_lr to min_lr
-            progress = step / max(total_steps - 1, 1)
-            return base_lr + (min_lr - base_lr) * progress
-        
-        elif schedule == "cosine":
-            # Cosine annealing from base_lr to min_lr
-            import math
-            progress = step / max(total_steps - 1, 1)
-            return min_lr + (base_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        elif schedule == "warmup_cosine":
-            # Warmup then cosine decay
-            import math
-            if step < warmup_steps:
-                # Linear warmup
-                return min_lr + (base_lr - min_lr) * (step / warmup_steps)
-            else:
-                # Cosine decay after warmup
-                progress = (step - warmup_steps) / max(total_steps - warmup_steps - 1, 1)
-                return min_lr + (base_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        else:
-            raise ValueError(f"Unknown lr_schedule: {schedule}")
+        multiplier = get_lr_multiplier(
+            step=step,
+            total_steps=self.config.steps,
+            schedule=self.config.lr_schedule,
+            warmup_steps=self.config.warmup_steps,
+            min_lr_factor=self.config.min_lr / self.config.lr,
+        )
+        return self.config.lr * multiplier
     
     def _get_original_weight(self, step: int) -> float:
         """Compute original strokes weight for current step based on schedule.
@@ -326,29 +318,13 @@ class InverseClipassoOptimizer:
         if not self.config.refinement_mode:
             return 0.0
         
-        total_steps = self.config.steps
-        start_weight = self.config.original_weight_start
-        end_weight = self.config.original_weight
-        schedule = self.config.original_weight_schedule
-        
-        if schedule == "constant":
-            return end_weight
-        
-        elif schedule == "linear_up":
-            # Linear increase from start to end
-            progress = step / max(total_steps - 1, 1)
-            return start_weight + (end_weight - start_weight) * progress
-        
-        elif schedule == "cosine_up":
-            # Cosine increase from start to end (slower initially, faster later)
-            import math
-            progress = step / max(total_steps - 1, 1)
-            # Cosine from 1 to 0, so we use (1 - cos) / 2 to go from 0 to 1
-            cosine_progress = (1 - math.cos(math.pi * progress)) / 2
-            return start_weight + (end_weight - start_weight) * cosine_progress
-        
-        else:
-            return end_weight
+        return get_scheduled_weight(
+            step=step,
+            total_steps=self.config.steps,
+            start_weight=self.config.original_weight_start,
+            end_weight=self.config.original_weight,
+            schedule=self.config.original_weight_schedule,
+        )
     
     def _create_new_stroke(
         self,
@@ -365,71 +341,13 @@ class InverseClipassoOptimizer:
         Returns:
             New stroke tensor with shape [num_points, 2].
         """
-        num_points = self.config.new_stroke_points
-        mode = self.config.stroke_init_mode
-        padding = 20  # Keep strokes away from edges
-        
-        if mode == "random":
-            # Random position and shape
-            center_x = torch.rand(1).item() * (canvas_size - 2 * padding) + padding
-            center_y = torch.rand(1).item() * (canvas_size - 2 * padding) + padding
-            
-            # Create a small stroke around the center
-            angles = torch.linspace(0, 2 * 3.14159, num_points + 1)[:-1]
-            radius = 15 + torch.rand(1).item() * 20  # Random radius 15-35
-            
-            points = torch.zeros(num_points, 2)
-            for i, angle in enumerate(angles):
-                # Add some randomness to each point
-                r = radius * (0.8 + 0.4 * torch.rand(1).item())
-                points[i, 0] = center_x + r * torch.cos(angle)
-                points[i, 1] = center_y + r * torch.sin(angle)
-            
-        elif mode == "center":
-            # Start from center of canvas
-            center_x = canvas_size / 2
-            center_y = canvas_size / 2
-            
-            # Small stroke near center
-            points = torch.zeros(num_points, 2)
-            for i in range(num_points):
-                points[i, 0] = center_x + (i - num_points/2) * 10 + torch.rand(1).item() * 5
-                points[i, 1] = center_y + torch.rand(1).item() * 20 - 10
-            
-        elif mode == "edge":
-            # Start from a random edge
-            edge = torch.randint(0, 4, (1,)).item()  # 0=top, 1=right, 2=bottom, 3=left
-            
-            if edge == 0:  # Top
-                start_x = torch.rand(1).item() * canvas_size
-                start_y = padding
-            elif edge == 1:  # Right
-                start_x = canvas_size - padding
-                start_y = torch.rand(1).item() * canvas_size
-            elif edge == 2:  # Bottom
-                start_x = torch.rand(1).item() * canvas_size
-                start_y = canvas_size - padding
-            else:  # Left
-                start_x = padding
-                start_y = torch.rand(1).item() * canvas_size
-            
-            # Create stroke moving inward
-            points = torch.zeros(num_points, 2)
-            direction = torch.rand(2) - 0.5
-            direction = direction / direction.norm() * 15  # Normalize to length 15
-            
-            for i in range(num_points):
-                points[i, 0] = start_x + direction[0] * i
-                points[i, 1] = start_y + direction[1] * i
-        
-        else:
-            # Default to random
-            points = torch.rand(num_points, 2) * (canvas_size - 2 * padding) + padding
-        
-        # Ensure points are within bounds
-        points = points.clamp(padding, canvas_size - padding)
-        
-        return points.to(self.device).requires_grad_(True)
+        return create_random_stroke(
+            canvas_size=canvas_size,
+            num_points=self.config.new_stroke_points,
+            mode=self.config.stroke_init_mode,
+            device=str(self.device),
+            padding=STROKE_INIT_PADDING,
+        )
     
     def _polyline_to_bezier_points(self, polyline: torch.Tensor) -> torch.Tensor:
         """
@@ -437,34 +355,7 @@ class InverseClipassoOptimizer:
         
         Takes a polyline [N, 2] and returns 4 control points [4, 2] for a cubic Bézier.
         """
-        n_points = polyline.shape[0]
-        
-        if n_points >= 4:
-            # Sample 4 evenly-spaced points
-            indices = torch.linspace(0, n_points - 1, 4).long()
-            return polyline[indices]
-        elif n_points == 3:
-            # Duplicate middle point
-            return torch.stack([
-                polyline[0],
-                polyline[1],
-                polyline[1],
-                polyline[2],
-            ])
-        elif n_points == 2:
-            # Create control points between endpoints
-            p0, p1 = polyline[0], polyline[1]
-            return torch.stack([
-                p0,
-                p0 + (p1 - p0) * 0.33,
-                p0 + (p1 - p0) * 0.67,
-                p1,
-            ])
-        else:
-            # Single point - create small curve
-            p = polyline[0]
-            offset = torch.tensor([10.0, 10.0], device=polyline.device)
-            return torch.stack([p - offset, p - offset * 0.5, p + offset * 0.5, p + offset])
+        return polyline_to_bezier(polyline)
     
     def _sample_bezier_curve(self, control_points: torch.Tensor, num_samples: int = 50) -> torch.Tensor:
         """
@@ -477,20 +368,7 @@ class InverseClipassoOptimizer:
         Returns:
             [num_samples, 2] tensor of sampled points
         """
-        device = control_points.device
-        t = torch.linspace(0, 1, num_samples, device=device).unsqueeze(1)  # [N, 1]
-        
-        P0, P1, P2, P3 = control_points[0], control_points[1], control_points[2], control_points[3]
-        
-        # Cubic Bézier formula: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
-        points = (
-            (1 - t) ** 3 * P0 +
-            3 * (1 - t) ** 2 * t * P1 +
-            3 * (1 - t) * t ** 2 * P2 +
-            t ** 3 * P3
-        )
-        
-        return points
+        return sample_bezier_curve(control_points, num_samples)
     
     def _render_with_bezier(self, bezier_controls: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -600,15 +478,40 @@ class InverseClipassoOptimizer:
             OptimizationResult with final strokes and loss history.
         """
         # Convert to Bézier control points if enabled
+        # Track original stroke boundaries for multi-segment mode
+        stroke_segment_counts: List[int] = []  # Number of Bézier segments per original stroke
+        
         if self.config.use_bezier:
             strokes = []
+            total_segments = 0
+            
             for s in init_strokes:
                 stroke = s.clone().detach().to(self.device)
-                # Convert polyline to Bézier control points [4, 2]
-                bezier_controls = self._polyline_to_bezier_points(stroke)
-                bezier_controls.requires_grad_(True)
-                strokes.append(bezier_controls)
-            print(f"  ✅ Converted {len(strokes)} strokes to Bézier curves")
+                
+                if self.config.bezier_multi_segment:
+                    # Convert to multiple Bézier curves for better fidelity
+                    bezier_list = polyline_to_bezier_segments(
+                        stroke, 
+                        max_points_per_segment=self.config.bezier_max_points_per_segment
+                    )
+                    stroke_segment_counts.append(len(bezier_list))
+                    for bezier_controls in bezier_list:
+                        bezier_controls = bezier_controls.clone().detach()
+                        bezier_controls.requires_grad_(True)
+                        strokes.append(bezier_controls)
+                    total_segments += len(bezier_list)
+                else:
+                    # Single Bézier per stroke (original behavior)
+                    bezier_controls = self._polyline_to_bezier_points(stroke)
+                    bezier_controls.requires_grad_(True)
+                    strokes.append(bezier_controls)
+                    stroke_segment_counts.append(1)
+                    total_segments += 1
+            
+            if self.config.bezier_multi_segment:
+                print(f"  ✅ Converted {len(init_strokes)} strokes to {total_segments} Bézier segments")
+            else:
+                print(f"  ✅ Converted {len(strokes)} strokes to Bézier curves")
         else:
             # Clone strokes and ensure they require gradients
             strokes = []
@@ -616,14 +519,16 @@ class InverseClipassoOptimizer:
                 stroke = s.clone().detach().to(self.device)
                 stroke.requires_grad_(True)
                 strokes.append(stroke)
+                stroke_segment_counts.append(1)
         
         # Save original strokes for refinement mode (detached, no grad)
         original_strokes: Optional[List[torch.Tensor]] = None
         if self.config.refinement_mode:
             original_strokes = [s.clone().detach() for s in strokes]
-            # Initialize original weight in loss_weights (will be updated each step)
-            if "original" not in self.config.loss_weights:
-                self.config.loss_weights["original"] = 0.0  # Will be updated per-step
+        
+        # Create local copy of loss weights to avoid mutating config
+        # This ensures the optimizer can be run multiple times with consistent behavior
+        loss_weights = self.config.loss_weights.copy()
         
         # Setup optimizer (use SGD with momentum for better exploration)
         optimizer = torch.optim.Adam(strokes, lr=self.config.lr)
@@ -669,9 +574,10 @@ class InverseClipassoOptimizer:
                 param_group['lr'] = current_lr
             
             # Update original weight based on schedule (refinement mode)
+            current_original_weight = 0.0
             if self.config.refinement_mode:
                 current_original_weight = self._get_original_weight(step)
-                self.config.loss_weights["original"] = current_original_weight
+                loss_weights["original"] = current_original_weight
             
             optimizer.zero_grad()
             
@@ -683,23 +589,21 @@ class InverseClipassoOptimizer:
                     strokes,
                     canvas_size=self.config.canvas_size,
                     stroke_width=self.config.stroke_width,
+                    device=self.device,
                 )
             
             # Compute losses
             losses = self._compute_losses(strokes, rendered, original_strokes)
             
             # Aggregate weighted loss
-            total_loss = aggregate_losses(losses, self.config.loss_weights)
+            total_loss = aggregate_losses(losses, loss_weights)
             
             # Backward pass
             total_loss.backward()
             
             # Add noise to gradients (helps escape local minima)
             if current_noise_scale > 0:
-                for stroke in strokes:
-                    if stroke.grad is not None:
-                        noise = torch.randn_like(stroke.grad) * current_noise_scale
-                        stroke.grad.add_(noise)
+                add_gradient_noise(strokes, current_noise_scale)
                 current_noise_scale *= self.config.noise_decay
             
             # Gradient clipping
@@ -740,9 +644,7 @@ class InverseClipassoOptimizer:
             loss_history["stroke"].append(losses.get("stroke", torch.tensor(0.0)).item())
             loss_history["tv"].append(losses.get("tv", torch.tensor(0.0)).item())
             loss_history["original"].append(losses.get("original", torch.tensor(0.0)).item())
-            loss_history["original_weight"].append(
-                self.config.loss_weights.get("original", 0.0) if self.config.refinement_mode else 0.0
-            )
+            loss_history["original_weight"].append(current_original_weight)
             loss_history["lr"].append(current_lr)
             loss_history["num_strokes"].append(len(strokes))
             
@@ -759,7 +661,7 @@ class InverseClipassoOptimizer:
                     'lr': f'{current_lr:.4f}',
                 }
                 if self.config.refinement_mode:
-                    postfix['ow'] = f'{self.config.loss_weights.get("original", 0):.3f}'
+                    postfix['ow'] = f'{current_original_weight:.3f}'
                 if self.config.allow_stroke_addition:
                     postfix['strokes'] = len(strokes)
                 steps_iter.set_postfix(postfix)

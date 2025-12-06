@@ -20,6 +20,12 @@ import torchvision.transforms.functional as TF
 import random
 import math
 
+__all__ = [
+    "CLIPAugmentations",
+    "DifferentiableAugmentations",
+    "get_augmenter",
+]
+
 
 class CLIPAugmentations(nn.Module):
     """

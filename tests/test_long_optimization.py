@@ -340,9 +340,9 @@ def run_long_optimization(
     snapshot_every=50,
     noise_scale=0.3,
     lr=3.0,
-    use_multi_prompt=False,
-    refinement_mode=False,
-    original_weight=0.5,
+    use_multi_prompt=True,
+    refinement_mode=True,
+    original_weight=0.25,
     original_weight_schedule="constant",  # "constant", "linear_up", "cosine_up"
     original_weight_start=0.1,  # Starting weight (for scheduled modes)
     # Exemplar-guided refinement (QuickDraw sketches)
@@ -352,8 +352,8 @@ def run_long_optimization(
     exemplar_weight=0.5,     # Weight for exemplar loss
     exemplar_mode="mean",    # "mean", "min", "softmin"
     # Photo exemplar guidance (real photos instead of sketches)
-    use_photo_exemplars=False,
-    photo_exemplar_dir=None,  # Directory with real photos (e.g., "data/photos/fish/")
+    use_photo_exemplars=True,
+    photo_exemplar_dir="data/photos/fish/",  # Directory with real photos (e.g., "data/photos/fish/")
     photo_exemplar_weight=0.5,  # Weight for photo exemplar loss
     # Reference image guidance (use a perfect sketch as target)
     use_reference_image=False,
@@ -361,10 +361,10 @@ def run_long_optimization(
     reference_image_weight=1.0,  # Weight for reference image loss
     # Stroke addition during optimization
     allow_stroke_addition=False,
-    stroke_add_interval=200,  # Add stroke every N steps
-    max_strokes=20,           # Maximum strokes to add
-    new_stroke_points=4,      # Control points per new stroke
-    stroke_init_mode="random",  # "random", "center", "edge"
+    stroke_add_interval=3,  # Add stroke every N steps
+    max_strokes=10,           # Maximum strokes to add
+    new_stroke_points=10,      # Control points per new stroke
+    stroke_init_mode="edge",  # "random", "center", "edge"
     # ===== CLIPasso-style features =====
     use_bezier=False,         # Use Bézier curves for smoother strokes
     bezier_samples=50,        # Points to sample per Bézier curve
@@ -706,7 +706,7 @@ def main():
         init_strokes=init_strokes,
         target_label=target_label,
         source_label=source_label,
-        steps=200,                                   # More steps for better convergence
+        steps=1000,                                   # More steps for better convergence
         snapshot_every=50,
         noise_scale=0.3 if is_refinement else 0.4,   # Moderate noise for exploration
         lr=2.5 if is_refinement else 3.0,            # Higher LR for faster initial progress
@@ -731,10 +731,10 @@ def main():
         exemplar_weight=0.0,
         exemplar_mode="mean",
         # STROKE ADDITION: Disabled - keep original stroke count
-        allow_stroke_addition=False,    # No new strokes
-        stroke_add_interval=200,
-        max_strokes=12,
-        new_stroke_points=5,
+        allow_stroke_addition=True,    # No new strokes
+        stroke_add_interval=10,
+        max_strokes=1,
+        new_stroke_points=4,
         stroke_init_mode="random",
         # ===== CLIPasso-style features =====
         use_bezier=True,           # 🔷 ENABLED - smoother Bézier curves!

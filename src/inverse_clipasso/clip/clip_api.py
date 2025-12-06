@@ -62,7 +62,7 @@ class ClipModel:
             emb = self.model.encode_image(img_input)
         else:
             # No gradients for inference (faster, less memory)
-        with torch.no_grad():
+            with torch.no_grad():
                 emb = self.model.encode_image(img_input)
         
         # Always return float32 for consistent downstream operations

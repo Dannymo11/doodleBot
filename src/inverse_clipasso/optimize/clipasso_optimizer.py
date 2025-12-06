@@ -46,11 +46,13 @@ from src.inverse_clipasso.optimize.losses import (
     total_variation,
     aggregate_losses,
 )
-
-
-# CLIP normalization constants
-CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073])
-CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711])
+from src.inverse_clipasso.optimize.common import (
+    CLIP_MEAN,
+    CLIP_STD,
+    get_lr_multiplier,
+    get_scheduled_weight,
+    add_gradient_noise,
+)
 
 
 @dataclass
@@ -327,49 +329,26 @@ class CLIPassoOptimizer:
     
     def _get_lr_multiplier(self, step: int) -> float:
         """Get learning rate multiplier for current step."""
-        total = self.config.steps
-        warmup = self.config.warmup_steps
-        min_factor = self.config.min_lr_factor
-        
-        if self.config.lr_schedule == "constant":
-            return 1.0
-        
-        elif self.config.lr_schedule == "cosine":
-            progress = step / max(total - 1, 1)
-            return min_factor + (1 - min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        elif self.config.lr_schedule == "warmup_cosine":
-            if step < warmup:
-                return min_factor + (1 - min_factor) * (step / warmup)
-            else:
-                progress = (step - warmup) / max(total - warmup - 1, 1)
-                return min_factor + (1 - min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        return 1.0
+        return get_lr_multiplier(
+            step=step,
+            total_steps=self.config.steps,
+            schedule=self.config.lr_schedule,
+            warmup_steps=self.config.warmup_steps,
+            min_lr_factor=self.config.min_lr_factor,
+        )
     
     def _get_original_weight(self, step: int) -> float:
         """Get original structure weight for current step."""
         if not self.config.refinement_mode:
             return 0.0
         
-        start = self.config.original_weight_start
-        end = self.config.original_weight
-        total = self.config.steps
-        schedule = self.config.original_weight_schedule
-        
-        if schedule == "constant":
-            return end
-        
-        progress = step / max(total - 1, 1)
-        
-        if schedule == "linear_up":
-            return start + (end - start) * progress
-        
-        elif schedule == "cosine_up":
-            cosine_progress = (1 - math.cos(math.pi * progress)) / 2
-            return start + (end - start) * cosine_progress
-        
-        return end
+        return get_scheduled_weight(
+            step=step,
+            total_steps=self.config.steps,
+            start_weight=self.config.original_weight_start,
+            end_weight=self.config.original_weight,
+            schedule=self.config.original_weight_schedule,
+        )
     
     def _compute_semantic_loss(
         self,
@@ -587,10 +566,10 @@ class CLIPassoOptimizer:
             
             # Add noise for exploration
             if current_noise > 0:
-                for stroke in sketch.strokes:
-                    if stroke.control_points.grad is not None:
-                        noise = torch.randn_like(stroke.control_points.grad) * current_noise
-                        stroke.control_points.grad.add_(noise)
+                add_gradient_noise(
+                    [stroke.control_points for stroke in sketch.strokes],
+                    current_noise
+                )
                 current_noise *= self.config.noise_decay
             
             # Gradient clipping
