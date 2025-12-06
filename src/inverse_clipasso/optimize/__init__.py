@@ -32,6 +32,10 @@ from .perceptual_loss import (
     CLIPassoLoss,
     compute_clip_loss_with_augmentations,
 )
+from .style_loss import (
+    VGGStyleLoss,
+    VGGFeatureExtractor,
+)
 from .common import (
     # Constants
     CLIP_MEAN,
@@ -89,6 +93,9 @@ __all__ = [
     "MultiScalePerceptualLoss",
     "CLIPassoLoss",
     "compute_clip_loss_with_augmentations",
+    # Style loss (VGG-based)
+    "VGGStyleLoss",
+    "VGGFeatureExtractor",
     # Common utilities
     "CLIP_MEAN",
     "CLIP_STD",

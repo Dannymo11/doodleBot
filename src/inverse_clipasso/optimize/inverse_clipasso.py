@@ -164,6 +164,19 @@ class OptimizationConfig:
     text_reference_blend: float = 0.5
     """Blend ratio: 0.0 = pure text, 1.0 = pure reference image."""
     
+    # Style loss (VGG-based, separate from CLIP)
+    use_style_loss: bool = False
+    """If True, adds VGG-based style loss using Gram matrices."""
+    
+    style_image: Optional[torch.Tensor] = None
+    """Style reference image [1, 3, H, W] in range [0, 1]. Texture/style will be matched."""
+    
+    style_weight: float = 1.0
+    """Weight for style loss. Higher = stronger texture matching."""
+    
+    style_layers: Optional[List[str]] = None
+    """VGG layers for style extraction. Default: ['conv1_1', 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1']"""
+    
     # Stroke addition during optimization
     allow_stroke_addition: bool = False
     """If True, allows adding new strokes during optimization."""
@@ -275,6 +288,19 @@ class InverseClipassoOptimizer:
                 perspective_scale=config.augment_perspective,
                 rotation_degrees=config.augment_rotation,
             )
+        
+        # Setup VGG style loss if enabled (separate from CLIP)
+        self.style_loss_module = None
+        if config.use_style_loss and config.style_image is not None:
+            from src.inverse_clipasso.optimize.style_loss import VGGStyleLoss
+            self.style_loss_module = VGGStyleLoss(
+                layers=config.style_layers,
+                device=str(self.device),
+            )
+            # Pre-compute style Gram matrices from reference image
+            style_img = config.style_image.to(self.device)
+            self.style_loss_module.set_style_target(style_img)
+            print(f"  ✅ VGG style loss enabled (layers: {self.style_loss_module.layers})")
         
         # Setup Bézier sketch if enabled
         self._bezier_sketch = None
@@ -441,6 +467,11 @@ class InverseClipassoOptimizer:
                 self.config.reference_image_embedding.to(self.device),
             ).mean()
         
+        # Style loss (VGG-based, separate from CLIP)
+        if self.config.use_style_loss and self.style_loss_module is not None:
+            # Style loss uses raw image (not CLIP-normalized) 
+            losses["style"] = self.style_loss_module(rendered_image)
+        
         # Stroke regularization (smoothness + length)
         # For Bézier, we regularize the control points directly
         if self.config.loss_weights.get("stroke", 0) > 0:
@@ -530,6 +561,14 @@ class InverseClipassoOptimizer:
         # This ensures the optimizer can be run multiple times with consistent behavior
         loss_weights = self.config.loss_weights.copy()
         
+        # Apply specific weight configs for optional losses
+        if self.config.use_exemplar_loss:
+            loss_weights["exemplar"] = self.config.exemplar_weight
+        if self.config.use_reference_image:
+            loss_weights["reference"] = self.config.reference_image_weight
+        if self.config.use_style_loss:
+            loss_weights["style"] = self.config.style_weight
+        
         # Setup optimizer (use SGD with momentum for better exploration)
         optimizer = torch.optim.Adam(strokes, lr=self.config.lr)
         
@@ -539,6 +578,7 @@ class InverseClipassoOptimizer:
             "semantic": [],
             "exemplar": [],  # For exemplar-guided refinement
             "reference": [],  # For reference image guidance
+            "style": [],  # For VGG-based style loss
             "stroke": [],
             "tv": [],
             "original": [],  # For refinement mode
@@ -641,6 +681,7 @@ class InverseClipassoOptimizer:
             loss_history["semantic"].append(losses.get("semantic", torch.tensor(0.0)).item())
             loss_history["exemplar"].append(losses.get("exemplar", torch.tensor(0.0)).item())
             loss_history["reference"].append(losses.get("reference", torch.tensor(0.0)).item())
+            loss_history["style"].append(losses.get("style", torch.tensor(0.0)).item())
             loss_history["stroke"].append(losses.get("stroke", torch.tensor(0.0)).item())
             loss_history["tv"].append(losses.get("tv", torch.tensor(0.0)).item())
             loss_history["original"].append(losses.get("original", torch.tensor(0.0)).item())

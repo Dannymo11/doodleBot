@@ -370,6 +370,11 @@ def run_long_optimization(
     bezier_samples=50,        # Points to sample per Bézier curve
     use_augmentations=False,  # Apply augmentations during CLIP encoding
     num_augments=4,           # Number of augmented views
+    # ===== VGG Style Loss (separate from CLIP) =====
+    use_style_loss=True,     # Use VGG-based style matching
+    style_image_path= "data/photos/fish/fish3.jpeg",    # Path to style reference image
+    style_weight=1.0,         # Weight for style loss
+    style_layers=None,        # VGG layers to use (default: conv1-5)
 ):
     """
     Run a long optimization and capture snapshots.
@@ -423,6 +428,9 @@ def run_long_optimization(
         print(f"  🔷 Bézier curves: ENABLED ({bezier_samples} samples)")
     if use_augmentations:
         print(f"  🔄 Augmentations: ENABLED ({num_augments} views)")
+    if use_style_loss:
+        layers_str = ", ".join(style_layers) if style_layers else "conv1_1-conv5_1"
+        print(f"  🎨 VGG Style loss: {style_image_path} (weight={style_weight}, layers={layers_str})")
     print(f"  Device: {device}")
     
     # Load CLIP
@@ -463,6 +471,19 @@ def run_long_optimization(
             device=device,
         )
     
+    # Load style image if requested (for VGG style loss)
+    style_image_tensor = None
+    if use_style_loss and style_image_path:
+        import torchvision.transforms as T
+        print(f"  Loading style reference image: {style_image_path}")
+        style_img = Image.open(style_image_path).convert("RGB")
+        style_transform = T.Compose([
+            T.Resize((224, 224)),
+            T.ToTensor(),
+        ])
+        style_image_tensor = style_transform(style_img).unsqueeze(0).to(device)
+        print(f"    Style image shape: {style_image_tensor.shape}")
+    
     # Build loss weights
     # SEMANTIC is the CLIP text embedding loss - increase to emphasize text more
     loss_weights = {
@@ -475,6 +496,8 @@ def run_long_optimization(
         loss_weights["exemplar"] = photo_exemplar_weight if use_photo_exemplars else exemplar_weight
     if use_reference_image:
         loss_weights["reference"] = reference_image_weight
+    if use_style_loss:
+        loss_weights["style"] = style_weight
     
     # Configure optimization
     config = OptimizationConfig(
@@ -515,6 +538,11 @@ def run_long_optimization(
         max_strokes=max_strokes,
         new_stroke_points=new_stroke_points,
         stroke_init_mode=stroke_init_mode,
+        # VGG Style loss settings
+        use_style_loss=use_style_loss,
+        style_image=style_image_tensor,
+        style_weight=style_weight,
+        style_layers=style_layers,
     )
     
     # Callback to capture snapshots
@@ -706,10 +734,10 @@ def main():
         init_strokes=init_strokes,
         target_label=target_label,
         source_label=source_label,
-        steps=1000,                                   # More steps for better convergence
+        steps=1000,                                   
         snapshot_every=50,
         noise_scale=0.3 if is_refinement else 0.4,   # Moderate noise for exploration
-        lr=2.5 if is_refinement else 3.0,            # Higher LR for faster initial progress
+        lr=2.0 if is_refinement else 2.5,            # Higher LR for faster initial progress
         use_multi_prompt=True,                        # Always use multi-prompt now!
         refinement_mode=is_refinement,                # Preserve original when refining
         # ORIGINAL WEIGHT: Lower = more freedom for CLIP text to change the sketch
@@ -737,8 +765,13 @@ def main():
         new_stroke_points=4,
         stroke_init_mode="random",
         # ===== CLIPasso-style features =====
-        use_bezier=True,           # 🔷 ENABLED - smoother Bézier curves!
+        use_bezier=False,           # 🔷 ENABLED - smoother Bézier curves!
         bezier_samples=50,         # Points per curve
+        # ===== VGG Style Loss =====
+        # To match the texture/style of a reference image (separate from CLIP)
+        use_style_loss=True,      # 🎨 Set True to enable
+        style_image_path= "data/photos/fish/fish3.jpeg",     # Path to style reference image
+        style_weight=1.0,          # Weight for style matching
         use_augmentations=True,    # 🔄 ENABLED - robust CLIP guidance!
         num_augments=4,            # Number of augmented views
     )
